@@ -24,6 +24,7 @@ typedef struct Context_ {
     const char *  server_port;
     const char *  ext_if_name;
     const char *  wanted_ext_gw_ip;
+    char          client_ip[NI_MAXHOST];
     char          ext_gw_ip[64];
     char          server_ip[64];
     char          if_name[IFNAMSIZ];
@@ -47,7 +48,7 @@ static void signal_handler(int sig)
     exit_signal_received = 1;
 }
 
-static int firewall_rules(Context *context, int set)
+static int firewall_rules(Context *context, int set, int silent)
 {
     const char *       substs[][2] = { { "$LOCAL_TUN_IP6", context->local_tun_ip6 },
                                 { "$REMOTE_TUN_IP6", context->remote_tun_ip6 },
@@ -73,7 +74,7 @@ static int firewall_rules(Context *context, int set)
         return 0;
     }
     for (i = 0; cmds[i] != NULL; i++) {
-        if (shell_cmd(substs, cmds[i]) != 0) {
+        if (shell_cmd(substs, cmds[i], silent) != 0) {
             fprintf(stderr, "Unable to run [%s]: [%s]\n", cmds[i], strerror(errno));
             return -1;
         }
@@ -101,11 +102,9 @@ static int tcp_client(const char *address, const char *port)
         errno = EINVAL;
         return -1;
     }
-    if ((client_fd = socket(res->ai_family, SOCK_STREAM, IPPROTO_TCP)) == -1) {
-        freeaddrinfo(res);
-        return -1;
-    }
-    if (connect(client_fd, (const struct sockaddr *) res->ai_addr, res->ai_addrlen) != 0) {
+    if ((client_fd = socket(res->ai_family, SOCK_STREAM, IPPROTO_TCP)) == -1 ||
+        tcp_opts(client_fd) != 0 ||
+        connect(client_fd, (const struct sockaddr *) res->ai_addr, res->ai_addrlen) != 0) {
         freeaddrinfo(res);
         err = errno;
         (void) close(client_fd);
@@ -113,19 +112,13 @@ static int tcp_client(const char *address, const char *port)
         return -1;
     }
     freeaddrinfo(res);
-    if (tcp_opts(client_fd) != 0) {
-        err = errno;
-        (void) close(client_fd);
-        errno = err;
-        return -1;
-    }
     return client_fd;
 }
 
 static int tcp_listener(const char *address, const char *port)
 {
     struct addrinfo hints, *res;
-    int             eai;
+    int             eai, err;
     int             listen_fd;
     int             backlog = 1;
 
@@ -134,7 +127,7 @@ static int tcp_listener(const char *address, const char *port)
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_addr     = NULL;
-#ifdef __OpenBSD__
+#if defined(__OpenBSD__) || defined(__DragonFly__)
     if (address == NULL) {
         hints.ai_family = AF_INET;
     }
@@ -147,15 +140,18 @@ static int tcp_listener(const char *address, const char *port)
     }
     if ((listen_fd = socket(res->ai_family, SOCK_STREAM, IPPROTO_TCP)) == -1 ||
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (char *) (int[]){ 1 }, sizeof(int)) != 0) {
+        err = errno;
+        (void) close(listen_fd);
         freeaddrinfo(res);
+        errno = err;
         return -1;
     }
 #if defined(IPPROTO_IPV6) && defined(IPV6_V6ONLY)
     (void) setsockopt(listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, (char *) (int[]){ 0 }, sizeof(int));
 #endif
 #ifdef TCP_DEFER_ACCEPT
-    (void) setsockopt(listen_fd, SOL_TCP, TCP_DEFER_ACCEPT, (char *) (int[]){ TIMEOUT / 1000 },
-                      sizeof(int));
+    (void) setsockopt(listen_fd, SOL_TCP, TCP_DEFER_ACCEPT,
+                      (char *) (int[]){ ACCEPT_TIMEOUT / 1000 }, sizeof(int));
 #endif
     printf("Listening to %s:%s\n", address == NULL ? "*" : address, port);
     if (bind(listen_fd, (struct sockaddr *) res->ai_addr, (socklen_t) res->ai_addrlen) != 0 ||
@@ -190,15 +186,9 @@ static int server_key_exchange(Context *context, const int client_fd)
 
     memcpy(st, context->uc_kx_st, sizeof st);
     errno = EACCES;
-#ifdef TCP_DEFER_ACCEPT
-    if (safe_read_partial(client_fd, pkt1, sizeof pkt1) != sizeof pkt1) {
+    if (safe_read(client_fd, pkt1, sizeof pkt1, ACCEPT_TIMEOUT) != sizeof pkt1) {
         return -1;
     }
-#else
-    if (safe_read(client_fd, pkt1, sizeof pkt1, TIMEOUT) != sizeof pkt1) {
-        return -1;
-    }
-#endif
     uc_hash(st, h, pkt1, 32 + 8);
     if (memcmp(h, pkt1 + 32 + 8, 32) != 0) {
         return -1;
@@ -228,16 +218,16 @@ static int server_key_exchange(Context *context, const int client_fd)
 
 static int tcp_accept(Context *context, int listen_fd)
 {
-    char                    client_ip[NI_MAXHOST];
-    struct sockaddr_storage client_sa;
-    socklen_t               client_sa_len = sizeof client_sa;
+    char                    client_ip[NI_MAXHOST] = { 0 };
+    struct sockaddr_storage client_ss;
+    socklen_t               client_ss_len = sizeof client_ss;
     int                     client_fd;
     int                     err;
 
-    if ((client_fd = accept(listen_fd, (struct sockaddr *) &client_sa, &client_sa_len)) < 0) {
+    if ((client_fd = accept(listen_fd, (struct sockaddr *) &client_ss, &client_ss_len)) < 0) {
         return -1;
     }
-    if (client_sa_len <= (socklen_t) 0U) {
+    if (client_ss_len <= (socklen_t) 0U) {
         (void) close(client_fd);
         errno = EINTR;
         return -1;
@@ -248,17 +238,25 @@ static int tcp_accept(Context *context, int listen_fd)
         errno = err;
         return -1;
     }
-    getnameinfo((const struct sockaddr *) (const void *) &client_sa, client_sa_len, client_ip,
+    getnameinfo((const struct sockaddr *) (const void *) &client_ss, client_ss_len, client_ip,
                 sizeof client_ip, NULL, 0, NI_NUMERICHOST | NI_NUMERICSERV);
-    printf("Accepting new client from [%s]\n", client_ip);
+    printf("Connection attempt from [%s]\n", client_ip);
     context->congestion = 0;
     fcntl(client_fd, F_SETFL, fcntl(client_fd, F_GETFL, 0) | O_NONBLOCK);
+    if (context->client_fd != -1 &&
+        memcmp(context->client_ip, client_ip, sizeof context->client_ip) != 0) {
+        fprintf(stderr, "Closing: a session from [%s] is already active\n", context->client_ip);
+        (void) close(client_fd);
+        errno = EBUSY;
+        return -1;
+    }
     if (server_key_exchange(context, client_fd) != 0) {
         fprintf(stderr, "Authentication failed\n");
         (void) close(client_fd);
         errno = EACCES;
         return -1;
     }
+    memcpy(context->client_ip, client_ip, sizeof context->client_ip);
     return client_fd;
 }
 
@@ -298,17 +296,19 @@ static int client_key_exchange(Context *context)
 
 static int client_connect(Context *context)
 {
-    const char *ext_gw_ip;
+    const char *ext_gw_ip = NULL;
 
     context->client_buf.pos = 0;
     memset(context->client_buf.data, 0, sizeof context->client_buf.data);
+#ifndef NO_DEFAULT_ROUTES
     if (context->wanted_ext_gw_ip == NULL && (ext_gw_ip = get_default_gw_ip()) != NULL &&
         strcmp(ext_gw_ip, context->ext_gw_ip) != 0) {
         printf("Gateway changed from [%s] to [%s]\n", context->ext_gw_ip, ext_gw_ip);
-        firewall_rules(context, 0);
+        firewall_rules(context, 0, 0);
         snprintf(context->ext_gw_ip, sizeof context->ext_gw_ip, "%s", ext_gw_ip);
-        firewall_rules(context, 1);
+        firewall_rules(context, 1, 0);
     }
+#endif
     memset(context->uc_st, 0, sizeof context->uc_st);
     context->uc_st[context->is_server][0] ^= 1;
     context->client_fd = tcp_client(context->server_ip, context->server_port);
@@ -324,7 +324,7 @@ static int client_connect(Context *context)
         sleep(1);
         return -1;
     }
-    firewall_rules(context, 1);
+    firewall_rules(context, 1, 0);
     context->fds[POLLFD_CLIENT] =
         (struct pollfd){ .fd = context->client_fd, .events = POLLIN, .revents = 0 };
     puts("Connected");
@@ -363,7 +363,7 @@ static int event_loop(Context *context)
         return -2;
     }
     if ((found_fds = poll(fds, POLLFD_COUNT, 1500)) == -1) {
-        return -1;
+        return errno == EINTR ? 0 : -1;
     }
     if (fds[POLLFD_LISTENER].revents & POLLIN) {
         new_client_fd = tcp_accept(context, context->listen_fd);
@@ -378,7 +378,7 @@ static int event_loop(Context *context)
         context->client_fd = new_client_fd;
         client_buf->pos    = 0;
         memset(client_buf->data, 0, sizeof client_buf->data);
-        puts("Accepted");
+        puts("Session established");
         fds[POLLFD_CLIENT] = (struct pollfd){ .fd = context->client_fd, .events = POLLIN };
     }
     if ((fds[POLLFD_TUN].revents & POLLERR) || (fds[POLLFD_TUN].revents & POLLHUP)) {
@@ -452,10 +452,8 @@ static int event_loop(Context *context)
             }
             if (2 + TAG_LEN + MAX_PACKET_LEN != len_with_header) {
                 unsigned char *rbuf      = client_buf->len;
-                size_t         remaining = client_buf->pos - len_with_header, i;
-                for (i = 0; i < remaining; i++) {
-                    rbuf[i] = rbuf[len_with_header + i];
-                }
+                size_t         remaining = client_buf->pos - len_with_header;
+                memmove(rbuf, rbuf + len_with_header, remaining);
             }
             client_buf->pos -= len_with_header;
         }
@@ -518,7 +516,11 @@ __attribute__((noreturn)) static void usage(void)
          "\n\n"
          "dsvpn\t\"client\"\n\t<key file>\n\t<vpn server ip or name>\n\t<vpn server "
          "port>|\"auto\"\n\t<tun interface>|\"auto\"\n\t<local tun "
-         "ip>|\"auto\"\n\t<remote tun ip>|\"auto\"\n\t<gateway ip>\"auto\"\n");
+         "ip>|\"auto\"\n\t<remote tun ip>|\"auto\"\n\t<gateway ip>|\"auto\"\n\n"
+         "Example:\n\n[server]\n\tdd if=/dev/urandom of=vpn.key count=1 bs=32\t# create key\n"
+         "\tbase64 < vpn.key\t\t# copy key as a string\n\tsudo ./dsvpn server vpn.key\t# listen on "
+         "443\n\n[client]\n\techo ohKD...W4= | base64 --decode > vpn.key\t# paste key\n"
+         "\tsudo ./dsvpn client vpn.key 34.216.127.34\n");
     exit(254);
 }
 
@@ -544,7 +546,7 @@ static int resolve_ip(char *ip, size_t sizeof_ip, const char *ip_or_name)
     hints.ai_addr     = NULL;
     if ((eai = getaddrinfo(ip_or_name, NULL, &hints, &res)) != 0 ||
         (res->ai_family != AF_INET && res->ai_family != AF_INET6) ||
-        (eai = getnameinfo(res->ai_addr, res->ai_addrlen, ip, sizeof_ip, NULL, 0,
+        (eai = getnameinfo(res->ai_addr, res->ai_addrlen, ip, (socklen_t) sizeof_ip, NULL, 0,
                            NI_NUMERICHOST | NI_NUMERICSERV)) != 0) {
         fprintf(stderr, "Unable to resolve [%s]: [%s]\n", ip_or_name, gai_strerror(eai));
         return -1;
@@ -603,8 +605,13 @@ int main(int argc, char *argv[])
     pledge("stdio proc exec dns inet", NULL);
 #endif
     context.firewall_rules_set = -1;
+    if (context.server_ip_or_name != NULL &&
+        resolve_ip(context.server_ip, sizeof context.server_ip, context.server_ip_or_name) != 0) {
+        firewall_rules(&context, 0, 1);
+        return 1;
+    }
     if (context.is_server) {
-        if (firewall_rules(&context, 1) != 0) {
+        if (firewall_rules(&context, 1, 0) != 0) {
             return -1;
         }
 #ifdef __OpenBSD__
@@ -612,18 +619,14 @@ int main(int argc, char *argv[])
                context.remote_tun_ip);
 #endif
     } else {
-        firewall_rules(&context, 0);
-    }
-    if (context.server_ip_or_name != NULL &&
-        resolve_ip(context.server_ip, sizeof context.server_ip, context.server_ip_or_name) != 0) {
-        return 1;
+        firewall_rules(&context, 0, 1);
     }
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     if (doit(&context) != 0) {
         return -1;
     }
-    firewall_rules(&context, 0);
+    firewall_rules(&context, 0, 0);
     puts("Done.");
 
     return 0;
