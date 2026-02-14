@@ -95,7 +95,7 @@ dsvpn   "server"
         <vpn server port>|"auto"
         <tun interface>|"auto"
         <local tun ip>|"auto"
-        <remote tun ip>"auto"
+        <remote tun ip>|"auto"
         <external ip>|"auto"
 
 dsvpn   "client"
@@ -123,7 +123,7 @@ If all the remaining parameters of a command would be `auto`, they don't have to
 ## Related projects
 
 * Robert Debock maintains [an Ansible role for DSVPN](https://github.com/robertdebock/ansible-role-dsvpn)
-* [OpenMPTCProuter](http://www.openmptcprouter.com/) is an OpenWRT-based router OS that supports DSVPN
+* [OpenMPTCProuter](http://www.openmptcprouter.com/) is an OpenWrt-based router OS that supports DSVPN
 * Yecheng Fu maintains a [Docker image for DSVPN](https://github.com/cofyc/dsvpn-docker)
 
 ## Why
@@ -152,4 +152,4 @@ The cryptographic primitives used in DSVPN are available as a standalone project
 
 None.
 
-This is not intended to be a replacement for GloryTun or WireGuard. This is what I use, because it solves a problem I had. Extending it to solve different problems is not planned, but feel free to fork it and tailor it to your needs!
+This is what I use, because it solves a problem I had. Extending it to solve different problems is not planned, but feel free to fork it and tailor it to your needs!
